@@ -1,5 +1,9 @@
 package thepusher;
 
+import com.google.common.base.Predicate;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Iterables;
+
 import java.lang.annotation.Annotation;
 import java.lang.annotation.ElementType;
 import java.lang.annotation.Retention;
@@ -8,6 +12,8 @@ import java.lang.annotation.Target;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
@@ -73,15 +79,20 @@ public class PusherBase<E> implements Pusher<E> {
 
   @Override
   public <T> T create(Class<T> type) {
-    T o = instantiate(type);
-    push(o);
-    return o;
+    return push(instantiate(type));
   }
+
+  private static final Map<Class, Constructor[]> constructorMap = new ConcurrentHashMap<Class, Constructor[]>();
 
   private <T> T instantiate(Class<T> type) {
     try {
       T o = null;
-      Constructor<?>[] declaredConstructors = type.getDeclaredConstructors();
+      Constructor<?>[] declaredConstructors = constructorMap.get(type);
+      boolean cacheit = false;
+      if (declaredConstructors == null) {
+        cacheit = true;
+        declaredConstructors = type.getDeclaredConstructors();
+      }
       Object[] parameterValues = null;
       for (Constructor constructor : declaredConstructors) {
         constructor.setAccessible(true);
@@ -108,25 +119,15 @@ public class PusherBase<E> implements Pusher<E> {
             }
             parameterValues = new Object[length];
           }
-          E parameterBinding = (E) valueMethod.invoke(foundAnnotation);
-          Class removed = classBindings.remove(parameterBinding);
-          if (removed != null) {
-            rebind(parameterBinding, instantiate(removed));
-          }
-          if (instanceBindings.containsKey(parameterBinding)) {
-            parameterValues[i] = get(parameterBinding);
-            if (removed != null) {
-              push(parameterValues[i]);
-            }
-          } else {
-            throw new PusherException("Binding not bound: " + parameterBinding);
-          }
+          parameterValues[i] = getOrCreate((E) valueMethod.invoke(foundAnnotation));
         }
         if (parameterValues != null) {
+          if (cacheit) constructorMap.put(type, new Constructor[]{constructor});
           o = (T) constructor.newInstance(parameterValues);
         }
       }
       if (o == null) {
+        if (cacheit) constructorMap.put(type, new Constructor[0]);
         o = type.newInstance();
       }
       return o;
@@ -141,38 +142,55 @@ public class PusherBase<E> implements Pusher<E> {
     return value;
   }
 
+  private static final Map<Class, List<Field>> fieldsMap = new ConcurrentHashMap<Class, List<Field>>();
+
   @Override
   @SuppressWarnings({"unchecked"})
-  public <T> void push(T o) {
-    Field[] declaredFields = o.getClass().getDeclaredFields();
-    for (Field field : declaredFields) {
-      Annotation annotation = field.getAnnotation(pushAnnotation);
-      if (annotation != null) {
-        E fieldBinding;
-        try {
-          fieldBinding = (E) valueMethod.invoke(annotation);
-        } catch (Exception e) {
-          throw new PusherException(e);
-        }
-        Class removed = classBindings.remove(fieldBinding);
-        if (removed != null) {
-          rebind(fieldBinding, instantiate(removed));
-        }
-        Object bound = get(fieldBinding);
-        if (removed != null) {
-          push(bound);
-        }
-        if (bound == null) {
-          throw new PusherException(fieldBinding + " is not bound");
-        }
-        field.setAccessible(true);
-        try {
-          field.set(o, bound);
-        } catch (Exception e) {
-          throw new PusherException(e);
-        }
+  public <T> T push(T o) {
+    try {
+      List<Field> fields;
+      Class aClass = o.getClass();
+      fields = fieldsMap.get(aClass);
+      if (fields == null) {
+        fields = ImmutableList.copyOf(Iterables.filter(Arrays.asList(aClass.getDeclaredFields()), new Predicate<Field>() {
+          public boolean apply(Field field) {
+            Annotation annotation = field.getAnnotation(pushAnnotation);
+            if (annotation != null) {
+              field.setAccessible(true);
+            }
+            return annotation != null;
+          }
+        }));
+        fieldsMap.put(aClass, fields);
       }
+      for (Field field : fields) {
+        E fieldBinding = (E) valueMethod.invoke(field.getAnnotation(pushAnnotation));
+        Object bound = getOrCreate(fieldBinding);
+        field.set(o, bound);
+      }
+      return o;
+    } catch (PusherException e) {
+      throw e;
+    } catch (Exception e) {
+      throw new PusherException(e);
     }
+  }
+
+  private <T> Object getOrCreate(E fieldBinding) {
+    Object bound;
+    Class removed = classBindings.remove(fieldBinding);
+    if (removed != null) {
+      rebind(fieldBinding, instantiate(removed));
+    }
+    if (instanceBindings.containsKey(fieldBinding)) {
+      bound = get(fieldBinding);
+      if (removed != null) {
+        push(bound);
+      }
+    } else {
+      throw new PusherException(fieldBinding + " is not bound");
+    }
+    return bound;
   }
 
   @Override
@@ -207,11 +225,11 @@ public class PusherBase<E> implements Pusher<E> {
   /**
    * Create a new base Pusher.
    *
-   * @param simpleBindingClass
+   * @param bindingEnumeration
    * @param <E>
    * @return
    */
-  public static <E> Pusher<E> create(Class<E> simpleBindingClass, Class<? extends Annotation> pushAnnotation) {
-    return new PusherBase<E>(simpleBindingClass, pushAnnotation);
+  public static <E> Pusher<E> create(Class<E> bindingEnumeration, Class<? extends Annotation> pushAnnotation) {
+    return new PusherBase<E>(bindingEnumeration, pushAnnotation);
   }
 }
